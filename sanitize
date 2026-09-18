@@ -1,0 +1,435 @@
+#!/usr/bin/env bash
+# ./sanitize <input.pdf> [-o|--output <output.pdf>] [-f|--force] [--dpi N]
+# ./sanitize config [get|set|reset] ...
+# ./sanitize status
+#
+# Thin convenience wrapper around `docker compose run --rm sanitize-once`.
+# Sanitizing a PDF ALWAYS happens inside the hardened, network-less
+# container defined in docker-compose.yml (network_mode: none, non-root
+# user, read-only filesystem, dropped capabilities, resource limits) --
+# this script never calls the pdf-sanitizer CLI directly on the host for
+# that, so the project's security model is preserved for every
+# invocation, not only when someone remembers the full `docker compose
+# run` command.
+#
+# `config`/`status`, by contrast, never touch untrusted PDF content --
+# they just read/write the persisted settings file (".env", next to
+# this script and docker-compose.yml) that both this wrapper and
+# docker-compose.yml treat as the single source of truth for limits, DPI,
+# and image format/quality. They run directly here in bash, with no
+# Docker/Python required, so tweaking a limit never needs a rebuild or a
+# container at all -- see README "Limites configuráveis".
+#
+# Examples:
+#   ./sanitize untrusted.pdf
+#       -> writes ./untrusted-sanitizado.pdf
+#   ./sanitize untrusted.pdf -o clean.pdf
+#       -> writes ./clean.pdf
+#   ./sanitize untrusted.pdf --output /tmp/out/clean.pdf --force
+#   ./sanitize config
+#   ./sanitize config set --max-pages 1000 --memory 4G --format jpeg
+#   ./sanitize config set dpi 150
+#   ./sanitize config reset
+#   ./sanitize status
+#
+# Requires: Docker + Docker Compose v2 (the `docker compose` subcommand)
+# for sanitizing a PDF. `config`/`status` need only bash + awk.
+#
+# NOTE: "config" and "status" are reserved as the first argument -- a PDF
+# literally named "config" or "status" (no extension) would need
+# ./sanitize ./config instead. Any real *.pdf filename is unaffected.
+
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${PDF_SANITIZER_CONFIG_FILE:-${script_dir}/.env}"
+
+usage() {
+    cat >&2 <<'USAGE'
+Usage: ./sanitize <input.pdf> [-o|--output <output.pdf>] [-f|--force] [--dpi N]
+       ./sanitize config [get|set|reset] ...
+       ./sanitize status
+
+Runs pdf-sanitizer inside the network-isolated container (docker compose
+run sanitize-once). If -o/--output is omitted, the sanitized file is
+written next to the input as "<name>-sanitizado.pdf".
+
+Run './sanitize config --help' for the persisted configuration commands.
+USAGE
+    exit 1
+}
+
+usage_config() {
+    cat >&2 <<'USAGE'
+Usage: ./sanitize config [get]
+       ./sanitize config set [--max-pages N] [--max-input-size SIZE]
+                              [--max-output-size SIZE] [--memory SIZE]
+                              [--timeout SECONDS] [--dpi N]
+                              [--format png|jpeg] [--jpeg-quality N]
+                              [--tmpfs SIZE]
+       ./sanitize config set <setting-name> <value>
+       ./sanitize config reset
+
+Persists settings to .env (next to this script), which both this wrapper
+and docker-compose.yml read as the single source of truth -- no
+docker-compose.yml/Dockerfile edits, and no image rebuild, required.
+
+Sizes accept human-readable suffixes: 500M, 1G, 3G, 4G (binary/1024-based,
+integer magnitudes only -- e.g. "1.5G" is not supported by this bash
+wrapper; use the `pdf-sanitizer` Python CLI directly for that).
+
+Examples:
+  ./sanitize config
+  ./sanitize config set --max-pages 1000 --max-input-size 500M \
+      --max-output-size 3G --memory 4G --timeout 600 --dpi 150 \
+      --format jpeg --jpeg-quality 90
+  ./sanitize config set dpi 150
+  ./sanitize config reset
+USAGE
+    exit 1
+}
+
+# --------------------------------------------------------------------------- #
+# Persisted configuration: single registry of managed settings, kept in
+# lockstep (by array position) with persistent_config.MANAGED_SETTINGS on
+# the Python side, and with docker-compose.yml's ${VAR:-default} fallbacks.
+# --------------------------------------------------------------------------- #
+
+MANAGED_ENV_NAMES=(
+    PDF_SANITIZER_MAX_PAGES
+    PDF_SANITIZER_MAX_INPUT_BYTES
+    PDF_SANITIZER_MAX_OUTPUT_BYTES
+    PDF_SANITIZER_MAX_MEMORY_BYTES
+    PDF_SANITIZER_PROCESSING_TIMEOUT_SECONDS
+    PDF_SANITIZER_RENDER_DPI
+    PDF_SANITIZER_OUTPUT_IMAGE_FORMAT
+    PDF_SANITIZER_JPEG_QUALITY
+    PDF_SANITIZER_TMPFS_SIZE
+)
+MANAGED_CLI_KEYS=(max-pages max-input-size max-output-size memory timeout dpi format jpeg-quality tmpfs)
+MANAGED_LABELS=("Pages" "Input limit" "Output limit" "RAM" "Timeout" "DPI" "Image format" "JPEG quality" "TMPFS")
+MANAGED_UNIT_SUFFIX=("" "" "" "" "seconds" "" "" "" "")
+MANAGED_IS_SIZE=(0 1 1 1 0 0 0 0 1)
+# Recommended defaults -- must match Settings' own field defaults
+# (config.py) exactly; see README "Configuração rápida".
+MANAGED_DEFAULTS=(300 524288000 3221225472 2147483648 600 150 jpeg 90 2147483648)
+
+_index_for_cli_key() {
+    local key="$1" i n=${#MANAGED_CLI_KEYS[@]}
+    for ((i = 0; i < n; i++)); do
+        if [[ "${MANAGED_CLI_KEYS[$i]}" == "$key" ]]; then
+            echo "$i"
+            return 0
+        fi
+    done
+    return 1
+}
+
+_parse_size() {
+    local input="$1" num unit multiplier
+    if [[ "$input" =~ ^([0-9]+)([a-zA-Z]{0,3})$ ]]; then
+        num="${BASH_REMATCH[1]}"
+        unit="$(printf '%s' "${BASH_REMATCH[2]}" | tr '[:upper:]' '[:lower:]')"
+    else
+        echo "invalid size '$input': expected e.g. 524288000, 500M, 3G" >&2
+        return 1
+    fi
+    case "$unit" in
+        "" | b) multiplier=1 ;;
+        k | kb | ki | kib) multiplier=1024 ;;
+        m | mb | mi | mib) multiplier=$((1024 * 1024)) ;;
+        g | gb | gi | gib) multiplier=$((1024 * 1024 * 1024)) ;;
+        t | tb | ti | tib) multiplier=$((1024 * 1024 * 1024 * 1024)) ;;
+        *)
+            echo "unknown size unit '$unit' in '$input'" >&2
+            return 1
+            ;;
+    esac
+    echo $((num * multiplier))
+}
+
+_format_size() {
+    local bytes="$1" gib mib kib
+    gib=$((1024 * 1024 * 1024))
+    mib=$((1024 * 1024))
+    kib=1024
+    if ((bytes >= gib)); then
+        if ((bytes % gib == 0)); then echo "$((bytes / gib)) GiB"; else awk -v b="$bytes" -v u="$gib" 'BEGIN{printf "%.2f GiB\n", b/u}'; fi
+    elif ((bytes >= mib)); then
+        if ((bytes % mib == 0)); then echo "$((bytes / mib)) MiB"; else awk -v b="$bytes" -v u="$mib" 'BEGIN{printf "%.2f MiB\n", b/u}'; fi
+    elif ((bytes >= kib)); then
+        if ((bytes % kib == 0)); then echo "$((bytes / kib)) KiB"; else awk -v b="$bytes" -v u="$kib" 'BEGIN{printf "%.2f KiB\n", b/u}'; fi
+    else
+        echo "${bytes} B"
+    fi
+}
+
+_get_persisted_value() { # env_name
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    grep -E "^$1=" "$CONFIG_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || true
+}
+
+_effective_value() { # idx -- precedence: real env var > persisted file > default
+    local idx="$1" env_name="${MANAGED_ENV_NAMES[$1]}" from_env from_file
+    from_env="${!env_name:-}"
+    if [[ -n "$from_env" ]]; then
+        printf '%s' "$from_env"
+        return
+    fi
+    from_file="$(_get_persisted_value "$env_name")"
+    if [[ -n "$from_file" ]]; then
+        printf '%s' "$from_file"
+        return
+    fi
+    printf '%s' "${MANAGED_DEFAULTS[$idx]}"
+}
+
+_validate_and_normalize() { # idx raw_value
+    local idx="$1" raw="$2" cli_key="${MANAGED_CLI_KEYS[$1]}" normalized
+    case "$cli_key" in
+        max-pages)
+            [[ "$raw" =~ ^[0-9]+$ ]] && ((raw >= 1)) || { echo "error: max-pages must be a positive integer, got '$raw'" >&2; return 1; }
+            echo "$raw"
+            ;;
+        timeout)
+            [[ "$raw" =~ ^[0-9]+$ ]] && ((raw >= 1)) || { echo "error: timeout must be a positive integer number of seconds, got '$raw'" >&2; return 1; }
+            echo "$raw"
+            ;;
+        dpi)
+            [[ "$raw" =~ ^[0-9]+$ ]] && ((raw >= 36 && raw <= 600)) || { echo "error: dpi must be an integer between 36 and 600, got '$raw'" >&2; return 1; }
+            echo "$raw"
+            ;;
+        jpeg-quality)
+            [[ "$raw" =~ ^[0-9]+$ ]] && ((raw >= 1 && raw <= 100)) || { echo "error: jpeg-quality must be an integer between 1 and 100, got '$raw'" >&2; return 1; }
+            echo "$raw"
+            ;;
+        format)
+            normalized="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
+            [[ "$normalized" == "png" || "$normalized" == "jpeg" ]] || { echo "error: format must be 'png' or 'jpeg', got '$raw'" >&2; return 1; }
+            echo "$normalized"
+            ;;
+        max-input-size | max-output-size | memory | tmpfs)
+            normalized="$(_parse_size "$raw")" || return 1
+            ((normalized >= 1)) || { echo "error: $cli_key must be greater than zero, got '$raw'" >&2; return 1; }
+            echo "$normalized"
+            ;;
+        *)
+            echo "error: unknown setting '$cli_key'" >&2
+            return 1
+            ;;
+    esac
+}
+
+cmd_config_get() {
+    local i n=${#MANAGED_ENV_NAMES[@]} value display
+    for ((i = 0; i < n; i++)); do
+        value="$(_effective_value "$i")"
+        if [[ "${MANAGED_IS_SIZE[$i]}" == "1" ]]; then
+            display="$(_format_size "$value")"
+        elif [[ -n "${MANAGED_UNIT_SUFFIX[$i]}" ]]; then
+            display="$value ${MANAGED_UNIT_SUFFIX[$i]}"
+        else
+            display="$value"
+        fi
+        echo "${MANAGED_LABELS[$i]}: ${display}"
+    done
+    if [[ -f "$CONFIG_FILE" ]]; then
+        echo "Config file: ${CONFIG_FILE} (in use)"
+    else
+        echo "Config file: ${CONFIG_FILE} (not created yet -- using built-in defaults)"
+    fi
+}
+
+cmd_config_set() {
+    local requested_keys=() requested_vals=()
+
+    # Positional `KEY VALUE` form: only when the first token isn't a flag.
+    if [[ $# -ge 1 && "$1" != --* ]]; then
+        local key="$1"
+        shift
+        [[ $# -ge 1 ]] || { echo "error: '$key' was given without a value; usage: config set $key <value>" >&2; exit 1; }
+        requested_keys+=("$key")
+        requested_vals+=("$1")
+        shift
+    fi
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --max-pages | --max-input-size | --max-output-size | --memory | --timeout | --dpi | --format | --jpeg-quality | --tmpfs)
+                [[ $# -ge 2 ]] || { echo "error: $1 requires a value" >&2; exit 1; }
+                requested_keys+=("${1#--}")
+                requested_vals+=("$2")
+                shift 2
+                ;;
+            -h | --help)
+                usage_config
+                ;;
+            *)
+                echo "error: unknown argument: $1" >&2
+                usage_config
+                ;;
+        esac
+    done
+
+    if [[ ${#requested_keys[@]} -eq 0 ]]; then
+        echo "error: no settings provided -- see './sanitize config set --help'" >&2
+        exit 1
+    fi
+
+    local n=${#MANAGED_ENV_NAMES[@]} i
+    local new_values=()
+    for ((i = 0; i < n; i++)); do
+        new_values[$i]="$(_effective_value "$i")"
+    done
+
+    local ridx rkey rval idx normalized
+    for ((ridx = 0; ridx < ${#requested_keys[@]}; ridx++)); do
+        rkey="${requested_keys[$ridx]}"
+        rval="${requested_vals[$ridx]}"
+        if ! idx="$(_index_for_cli_key "$rkey")"; then
+            echo "error: unknown setting '${rkey}'. Valid settings: ${MANAGED_CLI_KEYS[*]}" >&2
+            exit 1
+        fi
+        normalized="$(_validate_and_normalize "$idx" "$rval")" || exit 1
+        new_values[$idx]="$normalized"
+    done
+
+    local tmp_file
+    tmp_file="$(mktemp "${CONFIG_FILE}.tmpXXXXXX")"
+    {
+        echo "# Persisted pdf-sanitizer configuration."
+        echo "# Generated and managed by ./sanitize config / pdf-sanitizer config."
+        echo "# Edit via the CLI, not by hand -- see README 'Configuração rápida'."
+        for ((i = 0; i < n; i++)); do
+            echo "${MANAGED_ENV_NAMES[$i]}=${new_values[$i]}"
+        done
+    } >"$tmp_file"
+    chmod 600 "$tmp_file"
+    mv "$tmp_file" "$CONFIG_FILE"
+
+    echo "OK: updated ${CONFIG_FILE}"
+    cmd_config_get
+}
+
+cmd_config_reset() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        rm -f "$CONFIG_FILE"
+        echo "OK: removed ${CONFIG_FILE}. Settings reverted to built-in defaults."
+    else
+        echo "Nothing to reset: ${CONFIG_FILE} does not exist -- already using built-in defaults."
+    fi
+    cmd_config_get
+}
+
+# --------------------------------------------------------------------------- #
+# Dispatch: config/status never touch Docker or untrusted PDF content.
+# --------------------------------------------------------------------------- #
+
+if [[ $# -ge 1 ]]; then
+    case "$1" in
+        config)
+            shift
+            case "${1:-get}" in
+                get) cmd_config_get ;;
+                set)
+                    shift
+                    cmd_config_set "$@"
+                    ;;
+                reset) cmd_config_reset ;;
+                -h | --help) usage_config ;;
+                *)
+                    echo "error: unknown config subcommand: $1" >&2
+                    usage_config
+                    ;;
+            esac
+            exit 0
+            ;;
+        status)
+            cmd_config_get
+            exit 0
+            ;;
+    esac
+fi
+
+# --------------------------------------------------------------------------- #
+# Sanitize a PDF -- always inside the isolated container.
+# --------------------------------------------------------------------------- #
+
+if [[ $# -lt 1 ]]; then
+    usage
+fi
+
+input=""
+output=""
+force="false"
+dpi=""
+
+# First positional argument is the input file; everything after it is a flag.
+input="$1"
+shift
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o | --output)
+            [[ $# -ge 2 ]] || { echo "error: $1 requires a value" >&2; usage; }
+            output="$2"
+            shift 2
+            ;;
+        -f | --force)
+            force="true"
+            shift
+            ;;
+        --dpi)
+            [[ $# -ge 2 ]] || { echo "error: $1 requires a value" >&2; usage; }
+            dpi="$2"
+            shift 2
+            ;;
+        -h | --help)
+            usage
+            ;;
+        *)
+            echo "error: unknown argument: $1" >&2
+            usage
+            ;;
+    esac
+done
+
+if [[ -z "$input" ]]; then
+    usage
+fi
+if [[ ! -f "$input" ]]; then
+    echo "error: input file not found: $input" >&2
+    exit 1
+fi
+
+# Resolve to absolute host paths up front so the volume mounts below are
+# correct regardless of the caller's current directory.
+input_dir="$(cd "$(dirname "$input")" && pwd)"
+input_name="$(basename "$input")"
+input_abs="${input_dir}/${input_name}"
+
+if [[ -z "$output" ]]; then
+    stem="${input_name%.*}"
+    output="${input_dir}/${stem}-sanitizado.pdf"
+fi
+
+output_parent="$(dirname "$output")"
+mkdir -p "$output_parent"
+output_dir="$(cd "$output_parent" && pwd)"
+output_name="$(basename "$output")"
+
+compose_args=(run --rm)
+compose_args+=(-v "${input_dir}:/data/input:ro")
+compose_args+=(-v "${output_dir}:/data/output")
+compose_args+=(sanitize-once sanitize "/data/input/${input_name}" -o "/data/output/${output_name}")
+if [[ "$force" == "true" ]]; then
+    compose_args+=(--force)
+fi
+if [[ -n "$dpi" ]]; then
+    compose_args+=(--dpi "$dpi")
+fi
+
+echo "Sanitizing (isolated, network-less container): ${input_abs}" >&2
+(cd "$script_dir" && docker compose "${compose_args[@]}")
+
+echo "Wrote: ${output_dir}/${output_name}" >&2

@@ -1,0 +1,82 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdf-sanitizer"
+version = "0.2.0"
+description = "Defense-in-depth sanitization of untrusted PDF files via render-and-reconstruct."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "pdf-sanitizer contributors" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: Text Processing :: General",
+]
+
+# See README.md "Dependencias" for the rationale, licensing notes, and
+# known limitations behind each of these choices. Versions below are
+# floors verified against each project's documentation/registry at the
+# time of writing (Sept 2026); re-verify before pinning exact versions in
+# a lockfile for production (see README "Como atualizar com seguranca").
+dependencies = [
+    "pypdfium2>=4.30,<5",
+    "pikepdf>=9.5,<10",
+    "img2pdf>=0.5,<1",
+    "pillow>=10.4,<12",
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.6,<3",
+    "typer>=0.12,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=5.0",
+    "pytest-timeout>=2.3",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[project.scripts]
+pdf-sanitizer = "pdf_sanitizer.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]  # line length is enforced by the formatter, not the linter
+
+[tool.ruff.lint.isort]
+known-first-party = ["pdf_sanitizer"]
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["pdf_sanitizer"]
+mypy_path = "src"
+warn_unused_ignores = true
+warn_redundant_casts = true
+disallow_untyped_defs = false
+check_untyped_defs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+# A generous ceiling per test, not a target: this project's own isolated
+# worker already enforces its own (much tighter, configurable) wall-clock
+# timeout internally, so a test hanging past this almost always means a
+# real deadlock bug (see security.run_isolated's queue/join ordering)
+# rather than a merely-slow test -- fail loudly instead of hanging CI.
+timeout = 120

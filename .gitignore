@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test / lint / type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local runtime artifacts -- this project must never write outside its
+# configured temp dir, but keep the repo clean if you point it here anyway.
+/tmp_pdf_sanitizer/
+*.sanitized.pdf
+
+# Persisted pdf-sanitizer configuration (see `./sanitize config` /
+# `pdf-sanitizer config`). Holds no secrets, but it's local, machine-
+# specific runtime state, not something to commit -- see .env.example
+# for the documented, version-controlled template of available keys.
+.env
+.env.*
+!.env.example
